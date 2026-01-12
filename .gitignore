@@ -1,0 +1,7 @@
+records.sqlite
+keys/
+cert/
+.env.server
+node_modules/
+.DS_Store
+
