@@ -9,6 +9,33 @@ const sqlite3 = require("sqlite3").verbose();
 
 dotenv.config({ path: path.join(__dirname, ".env.server") });
 
+function writeCertFromEnv(certEnvKey, keyEnvKey, certPath, keyPath) {
+  const certValue = process.env[certEnvKey];
+  const keyValue = process.env[keyEnvKey];
+
+  if (!certValue || !keyValue || !certPath || !keyPath) return;
+
+  const resolvedCertPath = path.resolve(__dirname, certPath);
+  const resolvedKeyPath = path.resolve(__dirname, keyPath);
+  const certDir = path.dirname(resolvedCertPath);
+  const keyDir = path.dirname(resolvedKeyPath);
+
+  if (!fs.existsSync(certDir)) {
+    fs.mkdirSync(certDir, { recursive: true });
+  }
+  if (!fs.existsSync(keyDir)) {
+    fs.mkdirSync(keyDir, { recursive: true });
+  }
+
+  if (!fs.existsSync(resolvedCertPath)) {
+    fs.writeFileSync(resolvedCertPath, certValue.replace(/\\n/g, "\n"));
+  }
+
+  if (!fs.existsSync(resolvedKeyPath)) {
+    fs.writeFileSync(resolvedKeyPath, keyValue.replace(/\\n/g, "\n"));
+  }
+}
+
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
 const dbPath = path.join(__dirname, "records.sqlite");
@@ -22,6 +49,13 @@ const CLIENT_CERT_PATH = process.env.CLIENT_CERT_PATH;
 const CLIENT_KEY_PATH = process.env.CLIENT_KEY_PATH;
 const AAD = process.env.AAD_STRING || "TOSS";
 const DECRYPTION_KEY_BASE64 = process.env.DECRYPTION_KEY_BASE64;
+
+writeCertFromEnv(
+  "TOSS_CLIENT_CERT",
+  "TOSS_CLIENT_KEY",
+  CLIENT_CERT_PATH,
+  CLIENT_KEY_PATH
+);
 
 const tossApi = axios.create({
   baseURL: AUTH_API_BASE,
