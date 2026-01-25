@@ -154,6 +154,40 @@ function getUserId(req) {
   return Math.trunc(parsed);
 }
 
+function getBirthYearRange(ageGroup, currentYear) {
+  switch (ageGroup) {
+    case "10s":
+      return { minYear: currentYear - 19, maxYear: currentYear - 10 };
+    case "20s":
+      return { minYear: currentYear - 29, maxYear: currentYear - 20 };
+    case "30s":
+      return { minYear: currentYear - 39, maxYear: currentYear - 30 };
+    case "40s":
+      return { minYear: 0, maxYear: currentYear - 40 };
+    default:
+      return null;
+  }
+}
+
+function buildDistribution(times, bucketCount) {
+  const distribution = Array(bucketCount).fill(0);
+  if (!times.length) return distribution;
+
+  const sorted = [...times].sort((a, b) => a - b);
+  const bucketSize = 100 / bucketCount;
+
+  sorted.forEach((_, index) => {
+    const percentile = (index / sorted.length) * 100;
+    const bucket = Math.min(
+      bucketCount - 1,
+      Math.floor(percentile / bucketSize)
+    );
+    distribution[bucket] += 1;
+  });
+
+  return distribution;
+}
+
 app.post("/auth/toss/login", async (req, res) => {
   const authorizationCode = req.body?.authorizationCode;
   const referrer = req.body?.referrer;
@@ -249,6 +283,104 @@ app.post("/auth/toss/login", async (req, res) => {
     console.error("토스 로그인 처리에 실패했어요.", status, data || error);
     res.status(502).json({ message: "Login failed" });
   }
+});
+
+app.post("/auth/toss/disconnect", (req, res) => {
+  console.info("[toss-disconnect] payload", req.body);
+  // TODO: handle user unlink (e.g., deactivate user, revoke tokens) if needed.
+  res.sendStatus(200);
+});
+
+app.get("/api/stats", (req, res) => {
+  const ageGroup = String(req.query?.ageGroup ?? "all");
+  const allowedGroups = new Set(["all", "10s", "20s", "30s", "40s"]);
+
+  if (!allowedGroups.has(ageGroup)) {
+    res.status(400).json({ message: "Invalid ageGroup" });
+    return;
+  }
+
+  const currentYear = new Date().getFullYear();
+  const range = getBirthYearRange(ageGroup, currentYear);
+  const userId = getUserId(req);
+
+  let whereClause = "";
+  let params = [];
+
+  if (ageGroup !== "all" && range) {
+    if (ageGroup === "40s") {
+      whereClause = "WHERE u.birth_year IS NOT NULL AND u.birth_year <= ?";
+      params = [range.maxYear];
+    } else {
+      whereClause =
+        "WHERE u.birth_year IS NOT NULL AND u.birth_year BETWEEN ? AND ?";
+      params = [range.minYear, range.maxYear];
+    }
+  }
+
+  db.all(
+    `SELECT r.time AS time
+     FROM records r
+     LEFT JOIN users u ON r.user_id = u.id
+     ${whereClause}`,
+    params,
+    (err, rows) => {
+      if (err) {
+        res.status(500).json({ message: "Failed to load stats" });
+        return;
+      }
+
+      const times = rows
+        .map((row) => Number(row?.time))
+        .filter((value) => Number.isFinite(value));
+      const sampleCount = times.length;
+      const averageTime =
+        sampleCount > 0
+          ? times.reduce((sum, value) => sum + value, 0) / sampleCount
+          : null;
+      const distribution = buildDistribution(times, 11);
+
+      const respondWithUserTime = (myTime) => {
+        const validMyTime = Number.isFinite(myTime) ? myTime : null;
+        const fasterCount =
+          validMyTime !== null
+            ? times.filter((value) => value < validMyTime).length
+            : 0;
+        const percentile =
+          validMyTime !== null && sampleCount > 0
+            ? Math.round((fasterCount / sampleCount) * 100)
+            : null;
+
+        res.json({
+          ageGroup,
+          myTime: validMyTime !== null ? Number(validMyTime.toFixed(2)) : null,
+          averageTime:
+            averageTime !== null ? Number(averageTime.toFixed(2)) : null,
+          percentile,
+          distribution,
+          sampleCount,
+        });
+      };
+
+      if (!userId) {
+        respondWithUserTime(null);
+        return;
+      }
+
+      db.get(
+        "SELECT MIN(time) AS bestTime FROM records WHERE user_id = ?",
+        [userId],
+        (bestErr, row) => {
+          if (bestErr) {
+            res.status(500).json({ message: "Failed to load user record" });
+            return;
+          }
+          const bestTime = Number(row?.bestTime);
+          respondWithUserTime(bestTime);
+        }
+      );
+    }
+  );
 });
 
 app.get("/auth/me", (req, res) => {
