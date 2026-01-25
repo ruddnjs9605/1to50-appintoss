@@ -5,7 +5,7 @@ const express = require("express");
 const fs = require("fs");
 const https = require("https");
 const path = require("path");
-const sqlite3 = require("sqlite3").verbose();
+const { Pool } = require("pg");
 
 dotenv.config({ path: path.join(__dirname, ".env.server") });
 
@@ -38,8 +38,6 @@ function writeCertFromEnv(certEnvKey, keyEnvKey, certPath, keyPath) {
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
-const dbPath = path.join(__dirname, "records.sqlite");
-const db = new sqlite3.Database(dbPath);
 const TOSS_API_BASE_URL =
   process.env.TOSS_API_BASE_URL || "https://apps-in-toss-api.toss.im";
 const AUTH_API_BASE =
@@ -49,6 +47,7 @@ const CLIENT_CERT_PATH = process.env.CLIENT_CERT_PATH;
 const CLIENT_KEY_PATH = process.env.CLIENT_KEY_PATH;
 const AAD = process.env.AAD_STRING || "TOSS";
 const DECRYPTION_KEY_BASE64 = process.env.DECRYPTION_KEY_BASE64;
+const DATABASE_URL = process.env.DATABASE_URL;
 
 writeCertFromEnv(
   "TOSS_CLIENT_CERT",
@@ -71,33 +70,53 @@ const tossApi = axios.create({
   }),
 });
 
-db.serialize(() => {
-  db.run(
-    `CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      toss_user_key TEXT UNIQUE NOT NULL,
-      name TEXT,
-      birth_year INTEGER,
-      created_at TEXT NOT NULL
-    )`
-  );
-  db.run(
-    `CREATE TABLE IF NOT EXISTS records (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      time REAL NOT NULL,
-      user_id INTEGER,
-      created_at TEXT NOT NULL
-    )`
-  );
-
-  db.all("PRAGMA table_info(records)", (err, columns) => {
-    if (err || !Array.isArray(columns)) return;
-    const hasUserId = columns.some((column) => column.name === "user_id");
-    if (!hasUserId) {
-      db.run("ALTER TABLE records ADD COLUMN user_id INTEGER");
-    }
-  });
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
 });
+
+async function verifyDbConnection() {
+  if (!DATABASE_URL) {
+    console.error("[db] DATABASE_URL is missing");
+    return;
+  }
+  try {
+    await pool.query("SELECT 1");
+    console.info("[db] connected");
+  } catch (error) {
+    console.error("[db] connection failed", error);
+  }
+}
+
+async function initDb() {
+  if (!DATABASE_URL) return;
+  try {
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        toss_user_key TEXT UNIQUE NOT NULL,
+        name TEXT,
+        birth_year INTEGER,
+        created_at TIMESTAMP DEFAULT NOW()
+      )`
+    );
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS game_results (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        elapsed_time INTEGER NOT NULL,
+        cleared BOOLEAN NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )`
+    );
+    console.info("[db] tables ready");
+  } catch (error) {
+    console.error("[db] init failed", error);
+  }
+}
+
+verifyDbConnection();
+initDb();
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -245,38 +264,31 @@ app.post("/auth/toss/login", async (req, res) => {
 
     const name = decryptField(success.name);
     const birthYear = parseBirthYear(decryptField(success.birthday));
-    const createdAt = new Date().toISOString();
+    const userKeyValue = String(userKey);
 
-    db.get(
-      "SELECT id FROM users WHERE toss_user_key = ?",
-      [String(userKey)],
-      (selectErr, row) => {
-        if (selectErr) {
-          res.status(500).json({ message: "Failed to load user" });
-          return;
-        }
+    try {
+      const existing = await pool.query(
+        "SELECT id FROM users WHERE toss_user_key = $1",
+        [userKeyValue]
+      );
 
-        if (row?.id) {
-          console.info("[toss-login] user found", row.id);
-          res.json({ userId: row.id });
-          return;
-        }
-
-        db.run(
-          "INSERT INTO users (toss_user_key, name, birth_year, created_at) VALUES (?, ?, ?, ?)",
-          [String(userKey), name, birthYear, createdAt],
-          function onInsert(insertErr) {
-            if (insertErr) {
-              res.status(500).json({ message: "Failed to save user" });
-              return;
-            }
-
-            console.info("[toss-login] user created", this.lastID);
-            res.json({ userId: this.lastID });
-          }
-        );
+      if (existing.rows?.[0]?.id) {
+        console.info("[toss-login] user found", existing.rows[0].id);
+        res.json({ userId: existing.rows[0].id });
+        return;
       }
-    );
+
+      const inserted = await pool.query(
+        "INSERT INTO users (toss_user_key, name, birth_year) VALUES ($1, $2, $3) RETURNING id",
+        [userKeyValue, name, birthYear]
+      );
+      const newId = inserted.rows?.[0]?.id;
+      console.info("[toss-login] user created", newId);
+      res.json({ userId: newId });
+    } catch (dbError) {
+      console.error("[toss-login] user upsert failed", dbError);
+      res.status(500).json({ message: "Failed to save user" });
+    }
   } catch (error) {
     const status = error?.response?.status;
     const data = error?.response?.data;
@@ -291,7 +303,7 @@ app.post("/auth/toss/disconnect", (req, res) => {
   res.sendStatus(200);
 });
 
-app.get("/api/stats", (req, res) => {
+app.get("/api/stats", async (req, res) => {
   const ageGroup = String(req.query?.ageGroup ?? "all");
   const allowedGroups = new Set(["all", "10s", "20s", "30s", "40s"]);
 
@@ -304,86 +316,82 @@ app.get("/api/stats", (req, res) => {
   const range = getBirthYearRange(ageGroup, currentYear);
   const userId = getUserId(req);
 
-  let whereClause = "";
-  let params = [];
+  const whereParts = ["r.cleared = TRUE"];
+  const params = [];
 
   if (ageGroup !== "all" && range) {
     if (ageGroup === "40s") {
-      whereClause = "WHERE u.birth_year IS NOT NULL AND u.birth_year <= ?";
-      params = [range.maxYear];
+      whereParts.push(`u.birth_year IS NOT NULL AND u.birth_year <= $1`);
+      params.push(range.maxYear);
     } else {
-      whereClause =
-        "WHERE u.birth_year IS NOT NULL AND u.birth_year BETWEEN ? AND ?";
-      params = [range.minYear, range.maxYear];
+      whereParts.push(
+        `u.birth_year IS NOT NULL AND u.birth_year BETWEEN $1 AND $2`
+      );
+      params.push(range.minYear, range.maxYear);
     }
   }
 
-  db.all(
-    `SELECT r.time AS time
-     FROM records r
-     LEFT JOIN users u ON r.user_id = u.id
-     ${whereClause}`,
-    params,
-    (err, rows) => {
-      if (err) {
-        res.status(500).json({ message: "Failed to load stats" });
-        return;
-      }
+  const whereClause = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
 
-      const times = rows
-        .map((row) => Number(row?.time))
-        .filter((value) => Number.isFinite(value));
-      const sampleCount = times.length;
-      const averageTime =
-        sampleCount > 0
-          ? times.reduce((sum, value) => sum + value, 0) / sampleCount
+  try {
+    const results = await pool.query(
+      `SELECT r.elapsed_time AS time
+       FROM game_results r
+       LEFT JOIN users u ON r.user_id = u.id
+       ${whereClause}`,
+      params
+    );
+
+    const times = results.rows
+      .map((row) => Number(row?.time))
+      .filter((value) => Number.isFinite(value));
+    const sampleCount = times.length;
+    const averageTime =
+      sampleCount > 0
+        ? times.reduce((sum, value) => sum + value, 0) / sampleCount
+        : null;
+    const distribution = buildDistribution(times, 11);
+
+    const respondWithUserTime = (myTime) => {
+      const validMyTime = Number.isFinite(myTime) ? myTime : null;
+      const fasterCount =
+        validMyTime !== null
+          ? times.filter((value) => value < validMyTime).length
+          : 0;
+      const percentile =
+        validMyTime !== null && sampleCount > 0
+          ? Math.round((fasterCount / sampleCount) * 100)
           : null;
-      const distribution = buildDistribution(times, 11);
 
-      const respondWithUserTime = (myTime) => {
-        const validMyTime = Number.isFinite(myTime) ? myTime : null;
-        const fasterCount =
-          validMyTime !== null
-            ? times.filter((value) => value < validMyTime).length
-            : 0;
-        const percentile =
-          validMyTime !== null && sampleCount > 0
-            ? Math.round((fasterCount / sampleCount) * 100)
-            : null;
+      res.json({
+        ageGroup,
+        myTime: validMyTime !== null ? Number(validMyTime.toFixed(2)) : null,
+        averageTime:
+          averageTime !== null ? Number(averageTime.toFixed(2)) : null,
+        percentile,
+        distribution,
+        sampleCount,
+      });
+    };
 
-        res.json({
-          ageGroup,
-          myTime: validMyTime !== null ? Number(validMyTime.toFixed(2)) : null,
-          averageTime:
-            averageTime !== null ? Number(averageTime.toFixed(2)) : null,
-          percentile,
-          distribution,
-          sampleCount,
-        });
-      };
-
-      if (!userId) {
-        respondWithUserTime(null);
-        return;
-      }
-
-      db.get(
-        "SELECT MIN(time) AS bestTime FROM records WHERE user_id = ?",
-        [userId],
-        (bestErr, row) => {
-          if (bestErr) {
-            res.status(500).json({ message: "Failed to load user record" });
-            return;
-          }
-          const bestTime = Number(row?.bestTime);
-          respondWithUserTime(bestTime);
-        }
-      );
+    if (!userId) {
+      respondWithUserTime(null);
+      return;
     }
-  );
+
+    const best = await pool.query(
+      "SELECT MIN(elapsed_time) AS best_time FROM game_results WHERE user_id = $1 AND cleared = TRUE",
+      [userId]
+    );
+    const bestTime = Number(best.rows?.[0]?.best_time);
+    respondWithUserTime(bestTime);
+  } catch (error) {
+    console.error("[stats] failed", error);
+    res.status(500).json({ message: "Failed to load stats" });
+  }
 });
 
-app.get("/auth/me", (req, res) => {
+app.get("/auth/me", async (req, res) => {
   const userId = getUserId(req);
 
   if (!userId) {
@@ -391,31 +399,58 @@ app.get("/auth/me", (req, res) => {
     return;
   }
 
-  db.get(
-    "SELECT name, birth_year FROM users WHERE id = ?",
-    [userId],
-    (selectErr, row) => {
-      if (selectErr) {
-        res.status(503).json({ loggedIn: false });
-        return;
-      }
-      if (!row) {
-        res.status(401).json({ loggedIn: false });
-        return;
-      }
+  try {
+    const result = await pool.query(
+      "SELECT name, birth_year FROM users WHERE id = $1",
+      [userId]
+    );
 
-      res.json({
-        loggedIn: true,
-        user: {
-          name: row.name ?? null,
-          birthYear: row.birth_year ?? null,
-        },
-      });
+    if (result.rowCount === 0) {
+      res.status(401).json({ loggedIn: false });
+      return;
     }
-  );
+
+    const row = result.rows[0];
+    res.json({
+      loggedIn: true,
+      user: {
+        name: row.name ?? null,
+        birthYear: row.birth_year ?? null,
+      },
+    });
+  } catch (error) {
+    console.error("[auth/me] failed", error);
+    res.status(503).json({ loggedIn: false });
+  }
 });
 
-app.post("/result", (req, res) => {
+app.post("/api/results", async (req, res) => {
+  const elapsedTime = Number(req.body?.elapsedTime);
+  const cleared = req.body?.cleared;
+  const userId = getUserId(req);
+
+  if (!Number.isFinite(elapsedTime) || elapsedTime < 0) {
+    res.status(400).json({ message: "Invalid elapsedTime" });
+    return;
+  }
+  if (typeof cleared !== "boolean") {
+    res.status(400).json({ message: "Invalid cleared" });
+    return;
+  }
+
+  try {
+    await pool.query(
+      "INSERT INTO game_results (user_id, elapsed_time, cleared) VALUES ($1, $2, $3)",
+      [userId, Math.round(elapsedTime), cleared]
+    );
+    res.sendStatus(200);
+  } catch (error) {
+    console.error("[api/results] failed", error);
+    res.status(500).json({ message: "Failed to save result" });
+  }
+});
+
+app.post("/result", async (req, res) => {
   const time = Number(req.body?.time);
   const userId = getUserId(req);
 
@@ -429,67 +464,45 @@ app.post("/result", (req, res) => {
     return;
   }
 
-  const createdAt = new Date().toISOString();
+  const normalizedTime = Math.round(time);
 
-  db.run(
-    "INSERT INTO records (time, user_id, created_at) VALUES (?, ?, ?)",
-    [time, userId, createdAt],
-    (insertErr) => {
-      if (insertErr) {
-        res.status(500).json({ message: "Failed to save record" });
-        return;
-      }
+  try {
+    await pool.query(
+      "INSERT INTO game_results (user_id, elapsed_time, cleared) VALUES ($1, $2, TRUE)",
+      [userId, normalizedTime]
+    );
 
-      const isLoggedIn = true;
+    const best = await pool.query(
+      "SELECT MIN(elapsed_time) AS best_time FROM game_results WHERE user_id = $1 AND cleared = TRUE",
+      [userId]
+    );
+    const bestTime = Number(best.rows?.[0]?.best_time ?? normalizedTime);
 
-      const computeStats = (effectiveTime) => {
-        db.get(
-          `SELECT
-            AVG(time) AS averageTime,
-            SUM(CASE WHEN time < ? THEN 1 ELSE 0 END) AS fasterCount,
-            COUNT(*) AS totalCount
-          FROM records`,
-          [effectiveTime],
-          (statsErr, row) => {
-            if (statsErr) {
-              res.status(500).json({ message: "Failed to compute stats" });
-              return;
-            }
+    const stats = await pool.query(
+      `SELECT
+        AVG(elapsed_time) AS average_time,
+        SUM(CASE WHEN elapsed_time < $1 THEN 1 ELSE 0 END) AS faster_count,
+        COUNT(*) AS total_count
+      FROM game_results
+      WHERE cleared = TRUE`,
+      [bestTime]
+    );
 
-            const totalCount = row?.totalCount ?? 1;
-            const fasterCount = row?.fasterCount ?? 0;
-            const averageTime = row?.averageTime ?? effectiveTime;
-            const rankPercent = Math.round((fasterCount / totalCount) * 100);
+    const totalCount = Number(stats.rows?.[0]?.total_count ?? 1);
+    const fasterCount = Number(stats.rows?.[0]?.faster_count ?? 0);
+    const averageTime = Number(stats.rows?.[0]?.average_time ?? bestTime);
+    const rankPercent = Math.round((fasterCount / totalCount) * 100);
 
-            res.json({
-              myTime: Number(effectiveTime.toFixed(2)),
-              averageTime: Number(averageTime.toFixed(2)),
-              rankPercent,
-              isLoggedIn,
-            });
-          }
-        );
-      };
-
-      if (isLoggedIn) {
-        db.get(
-          "SELECT MIN(time) AS bestTime FROM records WHERE user_id = ?",
-          [userId],
-          (bestErr, row) => {
-            if (bestErr) {
-              res.status(500).json({ message: "Failed to compute best time" });
-              return;
-            }
-
-            const bestTime = row?.bestTime ?? time;
-            computeStats(bestTime);
-          }
-        );
-      } else {
-        computeStats(time);
-      }
-    }
-  );
+    res.json({
+      myTime: Number(bestTime.toFixed(2)),
+      averageTime: Number(averageTime.toFixed(2)),
+      rankPercent,
+      isLoggedIn: true,
+    });
+  } catch (error) {
+    console.error("[result] failed", error);
+    res.status(500).json({ message: "Failed to save record" });
+  }
 });
 
 app.listen(PORT, () => {
