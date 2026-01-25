@@ -387,7 +387,7 @@ app.get("/auth/me", (req, res) => {
   const userId = getUserId(req);
 
   if (!userId) {
-    res.json({ loggedIn: false });
+    res.status(401).json({ loggedIn: false });
     return;
   }
 
@@ -395,8 +395,12 @@ app.get("/auth/me", (req, res) => {
     "SELECT name, birth_year FROM users WHERE id = ?",
     [userId],
     (selectErr, row) => {
-      if (selectErr || !row) {
-        res.json({ loggedIn: false });
+      if (selectErr) {
+        res.status(503).json({ loggedIn: false });
+        return;
+      }
+      if (!row) {
+        res.status(401).json({ loggedIn: false });
         return;
       }
 
