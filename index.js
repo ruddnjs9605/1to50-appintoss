@@ -297,9 +297,38 @@ app.post("/auth/toss/login", async (req, res) => {
   }
 });
 
-app.post("/auth/toss/disconnect", (req, res) => {
+app.post("/auth/toss/disconnect", async (req, res) => {
+  const userKey = req.body?.userKey;
   console.info("[toss-disconnect] payload", req.body);
-  // TODO: handle user unlink (e.g., deactivate user, revoke tokens) if needed.
+
+  if (!userKey) {
+    console.warn("[toss-disconnect] missing userKey");
+    res.sendStatus(200);
+    return;
+  }
+
+  try {
+    const existing = await pool.query(
+      "SELECT id FROM users WHERE toss_user_key = $1",
+      [String(userKey)]
+    );
+    const userId = existing.rows?.[0]?.id;
+
+    if (!userId) {
+      console.info("[toss-disconnect] user not found");
+      res.sendStatus(200);
+      return;
+    }
+
+    await pool.query("UPDATE game_results SET user_id = NULL WHERE user_id = $1", [
+      userId,
+    ]);
+    await pool.query("DELETE FROM users WHERE id = $1", [userId]);
+    console.info("[toss-disconnect] user removed", userId);
+  } catch (error) {
+    console.error("[toss-disconnect] failed", error);
+  }
+
   res.sendStatus(200);
 });
 
@@ -392,7 +421,10 @@ app.get("/api/stats", async (req, res) => {
 });
 
 app.get("/auth/me", async (req, res) => {
-  const userId = getUserId(req);
+  const headerValue = req.get("x-user-id");
+  const parsed = Number(headerValue);
+  const userId =
+    Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : null;
 
   if (!userId) {
     res.status(401).json({ loggedIn: false });
